@@ -17,9 +17,13 @@
 
 package org.apache.seatunnel.connectors.seatunnel.clickhouse.sink.file;
 
+import com.clickhouse.client.ClickHouseException;
+import com.clickhouse.client.ClickHouseRequest;
+import com.clickhouse.client.ClickHouseResponse;
 import org.apache.seatunnel.api.sink.SinkWriter;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.common.config.Common;
+import org.apache.seatunnel.common.exception.CommonErrorCode;
 import org.apache.seatunnel.common.exception.CommonErrorCodeDeprecated;
 import org.apache.seatunnel.connectors.seatunnel.clickhouse.config.FileReaderOption;
 import org.apache.seatunnel.connectors.seatunnel.clickhouse.exception.ClickhouseConnectorErrorCode;
@@ -174,6 +178,7 @@ public class ClickhouseFileSinkWriter
     @Override
     public Optional<CKFileCommitInfo> prepareCommit() throws IOException {
         for (FileChannel channel : rowCache.values()) {
+            channel.truncate(channel.position());
             channel.close();
         }
         Map<Shard, List<String>> detachedFiles = new HashMap<>();
@@ -185,6 +190,8 @@ public class ClickhouseFileSinkWriter
                         // move file to server
                         moveClickhouseLocalFileToServer(shard, clickhouseLocalFiles);
                         detachedFiles.put(shard, clickhouseLocalFiles);
+                        //直接attach
+                        attachFileToClickhouse(shard,clickhouseLocalFiles);
                     } catch (Exception e) {
                         throw new ClickhouseConnectorException(
                                 CommonErrorCodeDeprecated.FLUSH_DATA_FAILED,
@@ -249,10 +256,29 @@ public class ClickhouseFileSinkWriter
         byte[] byteData = data.getBytes(StandardCharsets.UTF_8);
         if (buffer.position() + byteData.length > buffer.capacity()) {
             buffer =
-                    fileChannel.map(FileChannel.MapMode.READ_WRITE, fileChannel.size(), bufferSize);
+                    fileChannel.map(FileChannel.MapMode.READ_WRITE, fileChannel.position(), bufferSize);
             bufferCache.put(shard, buffer);
         }
         buffer.put(byteData);
+        fileChannel.position(fileChannel.size() - bufferSize + buffer.position());
+    }
+
+    private void attachFileToClickhouse(Shard shard, List<String> clickhouseLocalFiles)
+            throws ClickHouseException {
+        ClickHouseRequest<?> request = proxy.getClickhouseConnection(shard);
+        for (String clickhouseLocalFile : clickhouseLocalFiles) {
+            String attachSql = String.format(
+                    "ALTER TABLE %s ATTACH PART '%s'",
+                    clickhouseTable.getLocalTableName(),
+                    clickhouseLocalFile.substring(
+                            clickhouseLocalFile.lastIndexOf("/") + 1));
+            log.info("{} start attach : {}",shard.getNode().getHost(),clickhouseLocalFile);
+            ClickHouseResponse response =
+                    request.query(attachSql)
+                            .executeAndWait();
+            response.close();
+            log.info("{} end attach : {}",shard.getNode().getHost(),attachSql);
+        }
     }
 
     private List<String> generateClickhouseLocalFiles(String clickhouseLocalFileTmpFile)
